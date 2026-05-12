@@ -55,13 +55,13 @@ If you use this code in your own work, please cite our paper:
 ```
 @inproceedings{
     teymourian2026sora,
-    title={SORA: Free Second Order Attacks in Fast Adversarial Training},
+    title={{SORA}: Free Second Order Attacks in Fast Adversarial Training},
     author={Teymourian, Mazdak and Moslemi, Ramtin and Rahmani, Farzan and Rohban, Mohammad Hossein},
     booktitle={Proceedings of the 43rd International Conference on Machine Learning},
     publisher={PMLR},
     year={2026},
     doi={},
-    url={},
+    url={https://openreview.net/forum?id=uynAkGdnmj},
     note={accepted}
 }
 ```
