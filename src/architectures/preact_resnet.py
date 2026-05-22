@@ -3,146 +3,92 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Sequence, Tuple, Optional, Callable
 
+# Conv initialized with kaiming int, but uses fan-out instead of fan-in mode
+# Fan-out focuses on the gradient distribution, and is commonly used in ResNets
+resnet_kernel_init = nn.initializers.variance_scaling(2.0, mode='fan_out', distribution='normal')
 
-class PreActBlock(nn.Module):
-    """Pre‑activation basic residual block (two 3×3 convolutions)."""
-    planes: int          # output channels
-    stride: int = 1      # stride for the first convolution
-    expansion: int = 1   # expansion factor (1 for BasicBlock)
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
-        in_planes = x.shape[-1]          # assuming NHWC format
-
-        # pre‑activation for the residual path
-        out = nn.BatchNorm(use_running_average=not training)(x)
-        out = nn.relu(out)
-
-        # first convolution (may downsample)
-        out = nn.Conv(self.planes, kernel_size=(3, 3),
-                      strides=(self.stride, self.stride),
-                      padding='SAME', use_bias=False)(out)
-
-        # second convolution (pre‑activation before it)
-        out = nn.BatchNorm(use_running_average=not training)(out)
-        out = nn.relu(out)
-        out = nn.Conv(self.planes * self.expansion, kernel_size=(3, 3),
-                      strides=(1, 1), padding='SAME', use_bias=False)(out)
-
-        # shortcut (identity or projection)
-        if self.stride != 1 or in_planes != self.planes * self.expansion:
-            shortcut = nn.Conv(self.planes * self.expansion, kernel_size=(1, 1),
-                               strides=(self.stride, self.stride),
-                               use_bias=False)(x)
-        else:
-            shortcut = x
-
-        return out + shortcut
-
-
-class PreActBottleneck(nn.Module):
-    """Pre‑activation bottleneck block (1×1 → 3×3 → 1×1)."""
-    planes: int          # middle channels (output = planes * expansion)
-    stride: int = 1      # stride for the 3×3 convolution
-    expansion: int = 4   # expansion factor for the output channels
+class ResNetBlock(nn.Module):
+    act_fn : callable  # Activation function
+    c_out : int   # Output feature size
+    subsample : bool = False  # If True, we apply a stride inside F
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
-        in_planes = x.shape[-1]
-        out_planes = self.planes * self.expansion
+    def __call__(self, x, train=True):
+        # Network representing F
+        z = nn.Conv(self.c_out, kernel_size=(3, 3),
+                    strides=(1, 1) if not self.subsample else (2, 2),
+                    kernel_init=resnet_kernel_init,
+                    use_bias=False)(x)
+        z = nn.BatchNorm()(z, use_running_average=not train)
+        z = self.act_fn(z)
+        z = nn.Conv(self.c_out, kernel_size=(3, 3),
+                    kernel_init=resnet_kernel_init,
+                    use_bias=False)(z)
+        z = nn.BatchNorm()(z, use_running_average=not train)
 
-        # shortcut (applied to the input x, before any pre‑activation)
-        if self.stride != 1 or in_planes != out_planes:
-            shortcut = nn.Conv(out_planes, kernel_size=(1, 1),
-                               strides=(self.stride, self.stride),
-                               use_bias=False)(x)
-        else:
-            shortcut = x
+        if self.subsample:
+            x = nn.Conv(self.c_out, kernel_size=(1, 1), strides=(2, 2), kernel_init=resnet_kernel_init)(x)
 
-        # pre‑activation for the first 1×1 conv
-        out = nn.BatchNorm(use_running_average=not training)(x)
-        out = nn.relu(out)
-        out = nn.Conv(self.planes, kernel_size=(1, 1), use_bias=False)(out)
+        x_out = self.act_fn(z + x)
+        return x_out
+        
 
-        # pre‑activation for the 3×3 conv
-        out = nn.BatchNorm(use_running_average=not training)(out)
-        out = nn.relu(out)
-        out = nn.Conv(self.planes, kernel_size=(3, 3),
-                      strides=(self.stride, self.stride),
-                      padding='SAME', use_bias=False)(out)
-
-        # pre‑activation for the last 1×1 conv
-        out = nn.BatchNorm(use_running_average=not training)(out)
-        out = nn.relu(out)
-        out = nn.Conv(out_planes, kernel_size=(1, 1), use_bias=False)(out)
-
-        return out + shortcut
-
-
-class PreActResNet(nn.Module):
-    """Full Pre‑Activation ResNet."""
-    block: Callable          # PreActBlock or PreActBottleneck
-    num_blocks: Sequence[int]  # number of blocks in each layer
-    num_classes: int = 10
-    in_channels: int = 3
+class PreActResNetBlock(ResNetBlock):
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
-        # Initial convolution (no pre‑activation before it)
-        x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1),
-                    padding='SAME', use_bias=False)(x)
+    def __call__(self, x, train=True):
+        # Network representing F
+        z = nn.BatchNorm()(x, use_running_average=not train)
+        z = self.act_fn(z)
+        z = nn.Conv(self.c_out, kernel_size=(3, 3),
+                    strides=(1, 1) if not self.subsample else (2, 2),
+                    kernel_init=resnet_kernel_init,
+                    use_bias=False)(z)
+        z = nn.BatchNorm()(z, use_running_average=not train)
+        z = self.act_fn(z)
+        z = nn.Conv(self.c_out, kernel_size=(3, 3),
+                    kernel_init=resnet_kernel_init,
+                    use_bias=False)(z)
 
-        # Build the four main layers
-        x = self._make_layer(self.block, 64, self.num_blocks[0],
-                             stride=1, training=training)(x)
-        x = self._make_layer(self.block, 128, self.num_blocks[1],
-                             stride=2, training=training)(x)
-        x = self._make_layer(self.block, 256, self.num_blocks[2],
-                             stride=2, training=training)(x)
-        x = self._make_layer(self.block, 512, self.num_blocks[3],
-                             stride=2, training=training)(x)
+        if self.subsample:
+            x = nn.BatchNorm()(x, use_running_average=not train)
+            x = self.act_fn(x)
+            x = nn.Conv(self.c_out,
+                        kernel_size=(1, 1),
+                        strides=(2, 2),
+                        kernel_init=resnet_kernel_init,
+                        use_bias=False)(x)
 
-        # Final pre‑activation, global average pooling and classification
-        x = nn.BatchNorm(use_running_average=not training)(x)
-        x = nn.relu(x)
-        x = jnp.mean(x, axis=(1, 2))   # global average pool (NHWC → NC)
+        x_out = z + x
+        return x_out
+
+
+class ResNet(nn.Module):
+    num_classes : int
+    act_fn : callable
+    block_class : nn.Module
+    num_blocks : tuple = (3, 3, 3)
+    c_hidden : tuple = (16, 32, 64)
+
+    @nn.compact
+    def __call__(self, x, train=True):
+        # A first convolution on the original image to scale up the channel size
+        x = nn.Conv(self.c_hidden[0], kernel_size=(3, 3), kernel_init=resnet_kernel_init, use_bias=False)(x)
+        if self.block_class == ResNetBlock:  # If pre-activation block, we do not apply non-linearities yet
+            x = nn.BatchNorm()(x, use_running_average=not train)
+            x = self.act_fn(x)
+
+        # Creating the ResNet blocks
+        for block_idx, block_count in enumerate(self.num_blocks):
+            for bc in range(block_count):
+                # Subsample the first block of each group, except the very first one.
+                subsample = (bc == 0 and block_idx > 0)
+                # ResNet block
+                x = self.block_class(c_out=self.c_hidden[block_idx],
+                                     act_fn=self.act_fn,
+                                     subsample=subsample)(x, train=train)
+
+        # Mapping to classification output
+        x = x.mean(axis=(1, 2))
         x = nn.Dense(self.num_classes)(x)
         return x
-
-    def _make_layer(self, block: Callable, planes: int, num_blocks: int,
-                    stride: int, training: bool):
-        """Create a layer consisting of several residual blocks."""
-        layers = []
-        # First block may downsample
-        layers.append(block(planes, stride=stride))
-        # Remaining blocks have stride 1 and the same number of planes
-        for _ in range(1, num_blocks):
-            layers.append(block(planes, stride=1))
-
-        class Sequential(nn.Module):
-            blocks: Sequence[nn.Module]
-
-            @nn.compact
-            def __call__(self, x, training):
-                for block in self.blocks:
-                    x = block(x, training=training)
-                return x
-
-        return Sequential(blocks=layers)
-
-
-# Convenience constructors for different PreActResNet variants
-def PreActResNet18(**kwargs) -> PreActResNet:
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], **kwargs)
-
-def PreActResNet34(**kwargs) -> PreActResNet:
-    return PreActResNet(PreActBlock, [3, 4, 6, 3], **kwargs)
-
-def PreActResNet50(**kwargs) -> PreActResNet:
-    return PreActResNet(PreActBottleneck, [3, 4, 6, 3], **kwargs)
-
-def PreActResNet101(**kwargs) -> PreActResNet:
-    return PreActResNet(PreActBottleneck, [3, 4, 23, 3], **kwargs)
-
-def PreActResNet152(**kwargs) -> PreActResNet:
-    return PreActResNet(PreActBottleneck, [3, 8, 36, 3], **kwargs)
