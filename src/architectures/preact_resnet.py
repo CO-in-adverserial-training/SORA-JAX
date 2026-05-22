@@ -1,110 +1,148 @@
-'''Pre-activation ResNet in PyTorch.
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from typing import Sequence, Tuple, Optional, Callable
 
-Reference:
-[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
-    Identity Mappings in Deep Residual Networks. arXiv:1603.05027
-'''
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class PreActBlock(nn.Module):
-    '''Pre-activation version of the BasicBlock.'''
-    expansion = 1
+    """Pre‑activation basic residual block (two 3×3 convolutions)."""
+    planes: int          # output channels
+    stride: int = 1      # stride for the first convolution
+    expansion: int = 1   # expansion factor (1 for BasicBlock)
 
-    def __init__(self, in_planes, planes, stride=1):
-        super(PreActBlock, self).__init__()
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+        in_planes = x.shape[-1]          # assuming NHWC format
 
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        
-        if stride != 1 or in_planes != self.expansion*planes:
-            downsample_conv = nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False)
-            self.shortcut = nn.Sequential(downsample_conv)
+        # pre‑activation for the residual path
+        out = nn.BatchNorm(use_running_average=not training)(x)
+        out = nn.relu(out)
 
-    def forward(self, x):
-        out = F.relu(self.bn1(x))
-        shortcut = self.shortcut(x) if hasattr(self, 'shortcut') else x
-        out = self.conv1(out)
-        out = self.conv2(F.relu(self.bn2(out)))
-        out += shortcut
-        return out
+        # first convolution (may downsample)
+        out = nn.Conv(self.planes, kernel_size=(3, 3),
+                      strides=(self.stride, self.stride),
+                      padding='SAME', use_bias=False)(out)
+
+        # second convolution (pre‑activation before it)
+        out = nn.BatchNorm(use_running_average=not training)(out)
+        out = nn.relu(out)
+        out = nn.Conv(self.planes * self.expansion, kernel_size=(3, 3),
+                      strides=(1, 1), padding='SAME', use_bias=False)(out)
+
+        # shortcut (identity or projection)
+        if self.stride != 1 or in_planes != self.planes * self.expansion:
+            shortcut = nn.Conv(self.planes * self.expansion, kernel_size=(1, 1),
+                               strides=(self.stride, self.stride),
+                               use_bias=False)(x)
+        else:
+            shortcut = x
+
+        return out + shortcut
 
 
 class PreActBottleneck(nn.Module):
-    '''Pre-activation version of the original Bottleneck module.'''
-    expansion = 4
+    """Pre‑activation bottleneck block (1×1 → 3×3 → 1×1)."""
+    planes: int          # middle channels (output = planes * expansion)
+    stride: int = 1      # stride for the 3×3 convolution
+    expansion: int = 4   # expansion factor for the output channels
 
-    def __init__(self, in_planes, planes, stride=1):
-        super(PreActBottleneck, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, self.expansion*planes, kernel_size=1, bias=False)
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+        in_planes = x.shape[-1]
+        out_planes = self.planes * self.expansion
 
-        if stride != 1 or in_planes != self.expansion*planes:
-            downsample_conv = nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False)
+        # shortcut (applied to the input x, before any pre‑activation)
+        if self.stride != 1 or in_planes != out_planes:
+            shortcut = nn.Conv(out_planes, kernel_size=(1, 1),
+                               strides=(self.stride, self.stride),
+                               use_bias=False)(x)
+        else:
+            shortcut = x
 
-    def forward(self, x):
-        out = F.relu(self.bn1(x))
-        shortcut = self.shortcut(out) if hasattr(self, 'shortcut') else x
-        out = self.conv1(out)
-        out = self.conv2(F.relu(self.bn2(out)))
-        out = self.conv3(F.relu(self.bn3(out)))
-        out += shortcut
-        return out
+        # pre‑activation for the first 1×1 conv
+        out = nn.BatchNorm(use_running_average=not training)(x)
+        out = nn.relu(out)
+        out = nn.Conv(self.planes, kernel_size=(1, 1), use_bias=False)(out)
+
+        # pre‑activation for the 3×3 conv
+        out = nn.BatchNorm(use_running_average=not training)(out)
+        out = nn.relu(out)
+        out = nn.Conv(self.planes, kernel_size=(3, 3),
+                      strides=(self.stride, self.stride),
+                      padding='SAME', use_bias=False)(out)
+
+        # pre‑activation for the last 1×1 conv
+        out = nn.BatchNorm(use_running_average=not training)(out)
+        out = nn.relu(out)
+        out = nn.Conv(out_planes, kernel_size=(1, 1), use_bias=False)(out)
+
+        return out + shortcut
 
 
 class PreActResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes: int = 10, in_channels: int = 3):
-        super(PreActResNet, self).__init__()
-        
-        self.in_planes = 64
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
-       
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.bn = nn.BatchNorm2d(512 * block.expansion)
-        self.linear = nn.Linear(512 * block.expansion, num_classes)
+    """Full Pre‑Activation ResNet."""
+    block: Callable          # PreActBlock or PreActBottleneck
+    num_blocks: Sequence[int]  # number of blocks in each layer
+    num_classes: int = 10
+    in_channels: int = 3
 
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
+        # Initial convolution (no pre‑activation before it)
+        x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1),
+                    padding='SAME', use_bias=False)(x)
+
+        # Build the four main layers
+        x = self._make_layer(self.block, 64, self.num_blocks[0],
+                             stride=1, training=training)(x)
+        x = self._make_layer(self.block, 128, self.num_blocks[1],
+                             stride=2, training=training)(x)
+        x = self._make_layer(self.block, 256, self.num_blocks[2],
+                             stride=2, training=training)(x)
+        x = self._make_layer(self.block, 512, self.num_blocks[3],
+                             stride=2, training=training)(x)
+
+        # Final pre‑activation, global average pooling and classification
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        x = jnp.mean(x, axis=(1, 2))   # global average pool (NHWC → NC)
+        x = nn.Dense(self.num_classes)(x)
+        return x
+
+    def _make_layer(self, block: Callable, planes: int, num_blocks: int,
+                    stride: int, training: bool):
+        """Create a layer consisting of several residual blocks."""
         layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
+        # First block may downsample
+        layers.append(block(planes, stride=stride))
+        # Remaining blocks have stride 1 and the same number of planes
+        for _ in range(1, num_blocks):
+            layers.append(block(planes, stride=1))
 
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.relu(self.bn(out))
-        out = F.avg_pool2d(out, out.shape[-1])
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
+        class Sequential(nn.Module):
+            blocks: Sequence[nn.Module]
+
+            @nn.compact
+            def __call__(self, x, training):
+                for block in self.blocks:
+                    x = block(x, training=training)
+                return x
+
+        return Sequential(blocks=layers)
 
 
-def PreActResNet18(**kwargs):
-    return PreActResNet(PreActBlock, [2,2,2,2], **kwargs)
+# Convenience constructors for different PreActResNet variants
+def PreActResNet18(**kwargs) -> PreActResNet:
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], **kwargs)
 
-def PreActResNet34(**kwargs):
-    return PreActResNet(PreActBlock, [3,4,6,3], **kwargs)
+def PreActResNet34(**kwargs) -> PreActResNet:
+    return PreActResNet(PreActBlock, [3, 4, 6, 3], **kwargs)
 
-def PreActResNet50(**kwargs):
-    return PreActResNet(PreActBottleneck, [3,4,6,3], **kwargs)
+def PreActResNet50(**kwargs) -> PreActResNet:
+    return PreActResNet(PreActBottleneck, [3, 4, 6, 3], **kwargs)
 
-def PreActResNet101(**kwargs):
-    return PreActResNet(PreActBottleneck, [3,4,23,3], **kwargs)
+def PreActResNet101(**kwargs) -> PreActResNet:
+    return PreActResNet(PreActBottleneck, [3, 4, 23, 3], **kwargs)
 
-def PreActResNet152(**kwargs):
-    return PreActResNet(PreActBottleneck, [3,8,36,3], **kwargs)
+def PreActResNet152(**kwargs) -> PreActResNet:
+    return PreActResNet(PreActBottleneck, [3, 8, 36, 3], **kwargs)
